@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package raftrpc;
+
+// 生成 Service 基类 + CallMethod，便于 RPC 框架按名字反射分发
+option cc_generic_services = true;
+
+// ============================================================
+// 日志条目：Raft 的最小复制单位
+// ============================================================
+message LogEntry {
+  int32 term    = 1;   // 创建该条目时的 leader 任期
+  int32 index   = 2;   // 日志索引，从 1 开始连续递增（0 表示“日志起点”）
+  bytes command = 3;   // 上层命令字节流；Raft 层不解析
+}
+
+// ============================================================
+// 日志复制 / 心跳（entries 为空即心跳）
+// ============================================================
+message AppendEntriesArgs {
+  int32 term           = 1;  // leader 当前任期
+  int32 leader_id      = 2;  // leader 节点 id
+  int32 prev_log_index = 3;  // 新条目前一条的索引
+  int32 prev_log_term  = 4;  // 新条目前一条的任期
+  repeated LogEntry entries = 5;  // 空 ⇒ 心跳
+  int32 leader_commit  = 6;  // leader 已提交的索引
+}
+
+message AppendEntriesReply {
+  int32 term    = 1;  // follower 当前任期（leader 据此判断是否降级）
+  bool  success = 2;  // 前驱日志是否匹配
+
+  // success=false 时的快速回退信息（仅这两个字段有意义）
+  int32 conflict_term  = 3;  // 冲突位置的任期；-1 表示 follower 没有该位置日志
+  int32 conflict_index = 4;  // 该任期的第一条索引；或 lastLogIndex + 1
+}
+
+// ============================================================
+// 拉票
+// ============================================================
+message RequestVoteArgs {
+  int32 term           = 1;
+  int32 candidate_id   = 2;
+  int32 last_log_index = 3;
+  int32 last_log_term  = 4;
+}
+
+message RequestVoteReply {
+  int32 term         = 1;
+  bool  vote_granted = 2;
+}
+
+// ============================================================
+// 安装快照（Phase 6 使用；先定协议避免返工）
+// ============================================================
+message InstallSnapshotArgs {
+  int32 term                = 1;
+  int32 leader_id           = 2;
+  int32 last_included_index = 3;  // 快照覆盖到的最后一条日志索引
+  int32 last_included_term  = 4;
+  bytes data                = 5;  // 状态机快照字节流；Raft 层不解析
+
+  // 分块传输（进阶）：初版 offset=0、done=true
+  int32 offset = 6;
+  bool  done   = 7;
+}
+
+message InstallSnapshotReply {
+  int32 term = 1;
+}
+
+// ============================================================
+// Raft 节点之间的服务
+// ============================================================
+service RaftService {
+  rpc RequestVote     (RequestVoteArgs)     returns (RequestVoteReply);
+  rpc AppendEntries   (AppendEntriesArgs)   returns (AppendEntriesReply);
+  rpc InstallSnapshot (InstallSnapshotArgs) returns (InstallSnapshotReply);
+}

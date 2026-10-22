@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package kvrpc;
+
+option cc_generic_services = true;
+
+// ============================================================
+// 状态机命令：序列化后的字节即 LogEntry.command
+// ============================================================
+message Op {
+  enum Kind {
+    UNKNOWN = 0;
+    GET     = 1;   // 初版 GET 也走日志；后续可改 ReadIndex
+    PUT     = 2;
+    APPEND  = 3;
+    NOOP    = 4;   // leader 当选后提交，用于推进 commitIndex
+  }
+
+  Kind   kind       = 1;
+  string key        = 2;
+  bytes  value      = 3;
+  string client_id  = 4;  // 去重：客户端 UUID
+  int64  request_id = 5;  // 去重：客户端单调递增序号
+}
+
+// ============================================================
+// Get
+// ============================================================
+message GetArgs {
+  string key        = 1;
+  string client_id  = 2;
+  int64  request_id = 3;
+}
+
+message GetReply {
+  enum Code {
+    OK               = 0;
+    ERR_NO_KEY       = 1;
+    ERR_WRONG_LEADER = 2;  // 客户端换节点重试
+  }
+
+  Code  code        = 1;
+  bytes value       = 2;
+  int32 leader_hint = 3;  // 可选：当前 leader 的 id，加速客户端重试
+}
+
+// ============================================================
+// Put / Append
+// ============================================================
+message PutAppendArgs {
+  Op op = 1;  // 直接复用 Op，服务端可原样序列化进 Raft 日志
+}
+
+message PutAppendReply {
+  enum Code {
+    OK               = 0;
+    ERR_WRONG_LEADER = 1;
+  }
+
+  Code  code        = 1;
+  int32 leader_hint = 2;
+}
+
+// ============================================================
+// KV 服务（客户端 ↔ 任一服务节点）
+// ============================================================
+service KvService {
+  rpc Get       (GetArgs)       returns (GetReply);
+  rpc PutAppend (PutAppendArgs) returns (PutAppendReply);
+}
