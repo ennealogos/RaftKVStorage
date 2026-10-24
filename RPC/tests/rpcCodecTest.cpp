@@ -14,8 +14,8 @@
 
 #include "Buffer.h"
 #include "raft.pb.h"
-#include "rpc_codec.h"
-#include "rpc_header.pb.h"
+#include "RpcCodec.h"
+#include "RpcHeader.pb.h"
 
 namespace {
 
@@ -82,7 +82,7 @@ void testRequestRoundTrip() {
     CHECK(taken == frame);
     CHECK(buffer.readableBytes() == 0);
 
-    rpc::RpcHeader header;
+    rpc::RpcRequestHeader header;
     std::string args;
     CHECK(rpc::decodeRequest(taken, &header, &args));
     CHECK(header.service_name() == "RaftService");
@@ -252,7 +252,7 @@ void testHeaderLenExceedsFrame() {
     std::string bad = frame;
     writeU32(&bad, 4, static_cast<uint32_t>(bad.size()));  // header_len 过大
 
-    rpc::RpcHeader header;
+    rpc::RpcRequestHeader header;
     std::string args;
     CHECK(!rpc::decodeRequest(bad, &header, &args));
 }
@@ -265,7 +265,7 @@ void testFrameLenMismatch() {
     std::string bad = frame;
     writeU32(&bad, 0, static_cast<uint32_t>(bad.size() + 4));
 
-    rpc::RpcHeader header;
+    rpc::RpcRequestHeader header;
     std::string args;
     CHECK(!rpc::decodeRequest(bad, &header, &args));
 
@@ -278,10 +278,10 @@ void testFrameLenMismatch() {
 }
 
 // ------------------------------------------------------------------
-// 11. RpcHeader.args_size 与实际 args 长度不一致
+// 11. RpcRequestHeader.args_size 与实际 args 长度不一致
 // ------------------------------------------------------------------
 void testArgsSizeMismatch() {
-    rpc::RpcHeader header;
+    rpc::RpcRequestHeader header;
     header.set_service_name("RaftService");
     header.set_method_name("RequestVote");
     header.set_args_size(999);  // 故意不一致
@@ -296,7 +296,7 @@ void testArgsSizeMismatch() {
     frame += headerStr;
     frame += body;
 
-    rpc::RpcHeader outHeader;
+    rpc::RpcRequestHeader outHeader;
     std::string outArgs;
     CHECK(!rpc::decodeRequest(frame, &outHeader, &outArgs));
 }
@@ -325,7 +325,7 @@ void testLargeRequest() {
     std::string taken;
     CHECK(rpc::tryTakeFrame(&buffer, &taken));
 
-    rpc::RpcHeader header;
+    rpc::RpcRequestHeader header;
     std::string args;
     CHECK(rpc::decodeRequest(taken, &header, &args));
     CHECK(header.service_name() == "RaftService");

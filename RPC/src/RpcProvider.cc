@@ -1,9 +1,9 @@
-#include "rpc_provider.h"
+#include "RpcProvider.h"
 
 #include "Buffer.h"
 #include "Logger.h"
 #include "TcpConnection.h"
-#include "rpc_codec.h"
+#include "RpcCodec.h"
 #include "rpc_header.pb.h"
 
 #include <google/protobuf/stubs/callback.h>
@@ -63,9 +63,29 @@ void RpcProvider::onConnetion(const TcpConnectionPtr& conn) {
 void RpcProvider::onMessage(const TcpConnectionPtr& conn, Buffer* buf, Timestamp) {
     // 消息到来，可能存在半包，一个完整帧或多个数据帧的情况，循环读取，直到 buffer 中不再有完整帧
     // 读取一个帧后就分发消息
-    std::string frame;
-    while (rpc::tryTakeFrame(buf, &frame)) {
-        dispatch(conn, frame);
+    while (true) {
+        std::string frame;
+        auto state = rpc::tryTakeFrame(buf, &frame);
+
+        switch (state) {
+            case rpc::FrameState::kOk:
+                // tryTakeFrame 已经把这一帧从 buffer 中取走
+                dispatch(conn, frame);
+                continue;   // 继续尝试取下一帧
+
+            case rpc::FrameState::kExpectMore:
+                // 半包：数据留在 buffer 里，等下一次 read 事件再拼
+                return;
+
+            case rpc::FrameState::kCorrupt:
+                // 长度字段非法（<4 或 >max），协议已不可恢复
+                LOG_ERROR << "RpcProvider: corrupt frame, closing connection";
+                // 丢弃脏数据
+                buf->retrieveAll();
+                // 关闭连接
+                conn->forceClose();
+                return;
+        }
     }
 }
 

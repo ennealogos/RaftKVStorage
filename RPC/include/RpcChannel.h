@@ -41,5 +41,7 @@ private:
     bool connected_ = false;
     bool hasResponse_ = false;
     std::string responseFrame_;
+    uint64_t nextId_; // 下一个请求的 request_id
+    std::unordered_map<uint64_t, std::string> pending_; // request_id -> response 的映射
     std::string err_;
 };

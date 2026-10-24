@@ -1,14 +1,14 @@
-#include "rpc_channel.h"
+#include "RpcChannel.h"
 
 #include "Buffer.h"
 #include "EventLoop.h"
 #include "InetAddress.h"
 #include "Logger.h"
 #include "TcpConnection.h"
-#include "rpc_codec.h"
+#include "RpcCodec.h"
 
 RpcChannel::RpcChannel(EventLoop* loop, const std::string& ip, uint16_t port, int timeoutMs)
-: loop_(loop), timeoutMs_(timeoutMs) {
+: loop_(loop), timeoutMs_(timeoutMs), nextId_(0) {
     // 创建 TCP 客户端
     client_ = std::make_shared<TcpClient>(loop_, InetAddress(port, ip), "rpc-channel");
     // 设置回调函数

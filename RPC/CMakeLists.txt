@@ -8,7 +8,7 @@ find_package(Protobuf REQUIRED)
 set(PROTO_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/proto/raft.proto
     ${CMAKE_CURRENT_SOURCE_DIR}/proto/kv.proto
-    ${CMAKE_CURRENT_SOURCE_DIR}/proto/rpc_header.proto
+    ${CMAKE_CURRENT_SOURCE_DIR}/proto/RpcHeader.proto
 )
 
 # 生成 *.pb.cc/h 到 ${CMAKE_CURRENT_BINARY_DIR}
@@ -27,7 +27,7 @@ target_link_libraries(rpc_proto PUBLIC protobuf::libprotobuf)
 # ============================================================
 # RPC 框架库（当前只包含编解码器）
 # ============================================================
-add_library(rpc STATIC src/rpc_codec.cc)
+add_library(rpc STATIC src/RpcCodec.cc)
 
 target_include_directories(rpc
     PUBLIC
