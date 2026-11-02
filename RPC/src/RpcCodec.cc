@@ -28,9 +28,15 @@ namespace rpc {
 
 // 对节点请求进行编码，返回用于传输的数据帧
 std::string encodeRequest(const google::protobuf::MethodDescriptor* method, 
-                        const google::protobuf::Message& request, const int64_t& requestId) {
+                        const google::protobuf::Message& request, const uint64_t requestId) {
+    if (method == nullptr || method->service() == nullptr) {
+        return {};
+    }
+
     std::string args; // 要传输的业务数据（投票消息，日志同步消息等）
-    request.SerializeToString(&args); // 对要传输的请求进行序列化，并存储 args 中
+    if (!request.SerializeToString(&args)) {
+        return {};
+    }
 
     RpcRequestHeader header;
     header.set_service_name(method->service()->name());
@@ -61,10 +67,12 @@ std::string encodeRequest(const google::protobuf::MethodDescriptor* method,
 
 // 对响应进行编码，返回用于传输的数据帧
 std::string encodeResponse(const google::protobuf::Message& response, const int32_t errorCode,
-                         const std::string& errorText, const int64_t& requestId) {
-    // 数据帧组成：总长度 + 要传输的响应
+                         const std::string& errorText, const uint64_t requestId) {
+    // 只有成功响应才携带业务 body；错误响应 body 为空
     std::string body;
-    response.SerializeToString(&body);
+    if (errorCode == 0 && !response.SerializeToString(&body)) {
+        return {};
+    }
 
     RpcResponseHeader rspHeader;
     rspHeader.set_request_id(requestId);
@@ -90,7 +98,9 @@ std::string encodeResponse(const google::protobuf::Message& response, const int3
 }
 
 // 尝试从 buffer 中取出一个完整帧（包含开头的 4 字节 frame_len）。
-// 返回 false 表示数据还不完整（buffer 保持不变），不代表数据损坏。
+// kExpectMore：数据还不完整，buffer 保持不变，等下一次 read；
+// kCorrupt：长度字段非法，数据已不可恢复；
+// kOk：成功取出一帧。
 FrameState tryTakeFrame(Buffer* buffer, std::string* frame) {
     // 连长度字段都没收全
     if (buffer->readableBytes() < 4) {
@@ -115,47 +125,134 @@ FrameState tryTakeFrame(Buffer* buffer, std::string* frame) {
     return FrameState::kOk;
 }
 
-// 对数据帧解码
-FrameState decodeRequest(const std::string& frame, RpcRequestHeader* header, std::string* args) {
-    if (frame.size() < 8) { // frame_len + header_len 两个字段
-        return FrameState::kExpectMore;
+// 校验 frame，校验后的 frame 各字段存储在 view 中
+FrameState parseFrame(const std::string& frame, FrameView* view) {
+    // 校验帧大小是否符合要求，保证后续 int 转换的类型安全
+    if (frame.size() > kMaxFrameLen) {
+        return FrameState::kCorrupt;
     }
 
-    // 校验帧头长度与实际帧长一致（frame 来自 tryTakeFrame 时应恒成立）
-    uint32_t frame_len = readU32(frame.data());
-    if (frame_len != frame.size()) return FrameState::kCorrupt;
+    // 帧大小小于两个头部字段的大小，帧出现了问题
+    if (frame.size() < 8) {
+        return FrameState::kCorrupt;
+    }
 
-    uint32_t header_len = readU32(frame.data() + 4); // frame 中包含开头的 4 字节 frame_len
-    // 用 size_t 比较，避免 4 + 4 + header_len 在 uint32_t 下回绕
-    if (header_len > frame.size() - 8) return FrameState::kCorrupt; // 帧内数据不足以容纳 header
+    // 检查帧长是否符合头部中记录的帧长度
+    uint32_t frameLen = readU32(frame.data());
+    if (frameLen != frame.size()) {
+        return FrameState::kCorrupt;
+    }
 
-    if (!header->ParseFromArray(frame.data() + 8, static_cast<int>(header_len))) return FrameState::kCorrupt;
+    // 检查头部字段是否完整
+    uint32_t headerLen = readU32(frame.data() + 4);
+    // headerLen > frame.size() - 8 帧内数据不足以容纳 header
+    if (headerLen == 0 || headerLen > frame.size() - 8) {
+        return FrameState::kCorrupt;
+    }
 
-    size_t args_len = frame.size() - 8 - header_len;
-    if (header->args_size() != args_len) return FrameState::kCorrupt; // 交叉验证
-    args->assign(frame.data() + 8 + header_len, args_len);
+    // 将帧中各字段填入 view 中
+    view->header = frame.data() + 8;
+    view->header_len = headerLen;
+    view->body = frame.data() + 8 + headerLen;
+    view->body_len = frame.size() - 8 - headerLen;
+    return FrameState::kOk;
+}
+
+// 对数据帧解码
+FrameState decodeRequest(const std::string& frame, RpcRequestHeader* header, std::string* args) {
+    // 如果传入的接收头部和参数的指针为空，出错
+    if (header == nullptr || args == nullptr) {
+        return FrameState::kCorrupt;
+    }
+
+    FrameView view; // 解析出的头部和body都存放在 view 中
+    if (parseFrame(frame, &view) != FrameState::kOk) {
+        return FrameState::kCorrupt;
+    }
+
+    // 接收头部
+    if (!header->ParseFromArray(view.header, static_cast<int>(view.header_len))) {
+        return FrameState::kCorrupt;
+    }
+
+    // 0 是无效的请求 id
+    if (header->request_id() == 0) {
+        return FrameState::kCorrupt;
+    }
+
+    // 再次验证参数体大小是否正确
+    if (header->args_size() != view.body_len) {
+        return FrameState::kCorrupt;
+    }
+
+    // 接收参数体
+    args->assign(view.body, view.body_len);
+    return FrameState::kOk;
+}
+
+// 并发客户端在 IO 线程中并不知道具体的响应类型，不能直接 ParseFromArray，需要先将 body 原样取出，等待调用线程来解析
+FrameState decodeResponse(const std::string& frame, RpcResponseHeader* header, std::string* body) {
+    if (header == nullptr || body == nullptr) return FrameState::kCorrupt;
+
+    FrameView view;
+    if (parseFrame(frame, &view) != FrameState::kOk) {
+        return FrameState::kCorrupt;
+    }
+
+    if (!header->ParseFromArray(view.header, static_cast<int>(view.header_len))) {
+        return FrameState::kCorrupt;
+    }
+
+    if (header->request_id() == 0) {
+        return FrameState::kCorrupt;
+    }
+
+    if (header->error_code() != 0) {
+        body->clear();
+        return FrameState::kOk;
+    }
+
+    body->assign(view.body, view.body_len);
     return FrameState::kOk;
 }
 
 // 对响应解码
 FrameState decodeResponse(const std::string& frame, RpcResponseHeader* header, google::protobuf::Message* response) {
-    if (frame.size() < 8) return FrameState::kExpectMore;
+    if (response == nullptr) return FrameState::kCorrupt;
 
-    // 校验帧头长度与实际帧长一致
-    uint32_t frame_len = readU32(frame.data());
-    if (frame_len != frame.size()) return FrameState::kCorrupt;
+    std::string body;
+    auto state = decodeResponse(frame, header, &body);
+    if (state != FrameState::kOk) return state;
 
-    uint32_t header_len = readU32(frame.data() + 4); // frame 中包含开头的 4 字节 frame_len
-    // 用 size_t 比较，避免 4 + 4 + header_len 在 uint32_t 下回绕
-    if (header_len > frame.size() - 8) return FrameState::kCorrupt; // 帧内数据不足以容纳 header
-
-    if (!header->ParseFromArray(frame.data() + 8, static_cast<int>(header_len))) return FrameState::kCorrupt;
-
-    if (!response->ParseFromArray(frame.data() + 4, static_cast<int>(frame.size() - 4))) {
-        return FrameState::kCorrupt;
-    } else {
+    if (header->error_code() != 0) {
+        response->Clear();
         return FrameState::kOk;
     }
+
+    return response->ParseFromString(body) ? FrameState::kOk : FrameState::kCorrupt;
+}
+
+std::string encodeErrorResponse(int32_t errorCode, const std::string& errorText, uint64_t requestId) {
+    RpcResponseHeader header;
+    header.set_request_id(requestId);
+    header.set_error_code(errorCode);
+    header.set_error_text(errorText);
+
+    std::string headerStr;
+    if (!header.SerializeToString(&headerStr)) {
+        return {};
+    }
+
+    const size_t frameLenSize = 4 + 4 + headerStr.size();
+    if (frameLenSize > kMaxFrameLen) {
+        return {};
+    }
+
+    std::string frame;
+    appendU32(&frame, static_cast<uint32_t>(frameLenSize));
+    appendU32(&frame, static_cast<uint32_t>(headerStr.size()));
+    frame += headerStr;
+    return frame;
 }
 
 } // namespace rpc

@@ -1,10 +1,11 @@
 // RPC 编解码测试
 // 覆盖：
-//   1. 请求/响应往返
-//   2. 空响应体（frame_len == 4）
-//   3. 半包 / 粘包 / 部分帧
-//   4. 损坏的 frame_len / header_len / args_size
-//   5. 1MB 大消息
+//   1. 请求/响应往返（带 request_id）
+//   2. 空响应体
+//   3. 错误响应（error_code / error_text）
+//   4. 半包 / 粘包 / 部分帧
+//   5. 损坏的 frame_len / header_len / args_size / request_id
+//   6. 1MB 大消息
 #include <arpa/inet.h>
 
 #include <cstdint>
@@ -13,11 +14,13 @@
 #include <string>
 
 #include "Buffer.h"
-#include "raft.pb.h"
 #include "RpcCodec.h"
 #include "RpcHeader.pb.h"
+#include "raft.pb.h"
 
 namespace {
+
+constexpr uint64_t kRequestId = 42;
 
 int g_checks = 0;
 int g_failures = 0;
@@ -68,7 +71,7 @@ void testRequestRoundTrip() {
     const google::protobuf::MethodDescriptor* method = raftMethod("RequestVote");
     CHECK(method != nullptr);
 
-    std::string frame = rpc::encodeRequest(method, makeRequestVoteArgs());
+    std::string frame = rpc::encodeRequest(method, makeRequestVoteArgs(), kRequestId);
     CHECK(!frame.empty());
     CHECK(frame.size() >= 8);
     CHECK(readU32(frame.data()) == frame.size());  // frame_len 含自身
@@ -78,13 +81,14 @@ void testRequestRoundTrip() {
     buffer.append(frame);
 
     std::string taken;
-    CHECK(rpc::tryTakeFrame(&buffer, &taken));
+    CHECK(rpc::tryTakeFrame(&buffer, &taken) == rpc::FrameState::kOk);
     CHECK(taken == frame);
     CHECK(buffer.readableBytes() == 0);
 
     rpc::RpcRequestHeader header;
     std::string args;
-    CHECK(rpc::decodeRequest(taken, &header, &args));
+    CHECK(rpc::decodeRequest(taken, &header, &args) == rpc::FrameState::kOk);
+    CHECK(header.request_id() == kRequestId);
     CHECK(header.service_name() == "RaftService");
     CHECK(header.method_name() == "RequestVote");
     CHECK(header.args_size() == args.size());
@@ -105,19 +109,22 @@ void testResponseRoundTrip() {
     reply.set_term(5);
     reply.set_vote_granted(true);
 
-    std::string frame = rpc::encodeResponse(reply);
-    CHECK(frame.size() > 4);
+    std::string frame = rpc::encodeResponse(reply, 0, "", kRequestId);
+    CHECK(!frame.empty());
     CHECK(readU32(frame.data()) == frame.size());
 
     Buffer buffer;
     buffer.append(frame);
 
     std::string taken;
-    CHECK(rpc::tryTakeFrame(&buffer, &taken));
+    CHECK(rpc::tryTakeFrame(&buffer, &taken) == rpc::FrameState::kOk);
     CHECK(taken == frame);
 
+    rpc::RpcResponseHeader header;
     raftrpc::RequestVoteReply decoded;
-    CHECK(rpc::decodeResponse(taken, &decoded));
+    CHECK(rpc::decodeResponse(taken, &header, &decoded) == rpc::FrameState::kOk);
+    CHECK(header.request_id() == kRequestId);
+    CHECK(header.error_code() == 0);
     CHECK(decoded.term() == 5);
     CHECK(decoded.vote_granted());
 }
@@ -131,37 +138,68 @@ void testEmptyResponse() {
     CHECK(reply.SerializeToString(&body));
     CHECK(body.empty());
 
-    std::string frame = rpc::encodeResponse(reply);
-    CHECK(frame.size() == 4);
-    CHECK(readU32(frame.data()) == 4);
+    std::string frame = rpc::encodeResponse(reply, 0, "", kRequestId);
+    CHECK(!frame.empty());
+    CHECK(readU32(frame.data()) == frame.size());
 
     Buffer buffer;
     buffer.append(frame);
 
     std::string taken;
-    CHECK(rpc::tryTakeFrame(&buffer, &taken));
-    CHECK(taken.size() == 4);
+    CHECK(rpc::tryTakeFrame(&buffer, &taken) == rpc::FrameState::kOk);
 
+    rpc::RpcResponseHeader header;
     raftrpc::RequestVoteReply decoded;
-    CHECK(rpc::decodeResponse(taken, &decoded));
+    CHECK(rpc::decodeResponse(taken, &header, &decoded) == rpc::FrameState::kOk);
+    CHECK(header.request_id() == kRequestId);
+    CHECK(header.error_code() == 0);
     CHECK(decoded.term() == 0);
     CHECK(!decoded.vote_granted());
 }
 
 // ------------------------------------------------------------------
-// 4. 半包：每次只 append 1 字节
+// 4. 错误响应：body 为空，response 会被 Clear
+// ------------------------------------------------------------------
+void testErrorResponse() {
+    raftrpc::RequestVoteReply reply;
+    reply.set_term(9);  // 错误响应不应携带业务 body
+
+    std::string frame = rpc::encodeResponse(reply, 7, "unknown service", kRequestId);
+    CHECK(!frame.empty());
+
+    Buffer buffer;
+    buffer.append(frame);
+
+    std::string taken;
+    CHECK(rpc::tryTakeFrame(&buffer, &taken) == rpc::FrameState::kOk);
+
+    rpc::RpcResponseHeader header;
+    raftrpc::RequestVoteReply decoded;
+    decoded.set_term(123);  // 验证错误响应会 Clear
+    CHECK(rpc::decodeResponse(taken, &header, &decoded) == rpc::FrameState::kOk);
+    CHECK(header.request_id() == kRequestId);
+    CHECK(header.error_code() == 7);
+    CHECK(header.error_text() == "unknown service");
+    CHECK(decoded.term() == 0);
+}
+
+// ------------------------------------------------------------------
+// 5. 半包：每次只 append 1 字节
 // ------------------------------------------------------------------
 void testHalfPacket() {
-    std::string frame = rpc::encodeRequest(raftMethod("RequestVote"), makeRequestVoteArgs());
+    std::string frame = rpc::encodeRequest(raftMethod("RequestVote"), makeRequestVoteArgs(), kRequestId);
     Buffer buffer;
 
     int takenCount = 0;
     for (size_t i = 0; i < frame.size(); ++i) {
         buffer.append(frame.data() + i, 1);
         std::string taken;
-        if (rpc::tryTakeFrame(&buffer, &taken)) {
+        auto state = rpc::tryTakeFrame(&buffer, &taken);
+        if (state == rpc::FrameState::kOk) {
             ++takenCount;
             CHECK(taken == frame);
+        } else {
+            CHECK(state == rpc::FrameState::kExpectMore);
         }
     }
     CHECK(takenCount == 1);
@@ -169,11 +207,11 @@ void testHalfPacket() {
 }
 
 // ------------------------------------------------------------------
-// 5. 粘包：一次 append 两个完整帧
+// 6. 粘包：一次 append 两个完整帧
 // ------------------------------------------------------------------
 void testStickyPacket() {
-    std::string f1 = rpc::encodeRequest(raftMethod("RequestVote"), makeRequestVoteArgs());
-    std::string f2 = rpc::encodeRequest(raftMethod("AppendEntries"), raftrpc::AppendEntriesArgs());
+    std::string f1 = rpc::encodeRequest(raftMethod("RequestVote"), makeRequestVoteArgs(), 1);
+    std::string f2 = rpc::encodeRequest(raftMethod("AppendEntries"), raftrpc::AppendEntriesArgs(), 2);
 
     Buffer buffer;
     buffer.append(f1);
@@ -182,39 +220,39 @@ void testStickyPacket() {
     std::string t1;
     std::string t2;
     std::string t3;
-    CHECK(rpc::tryTakeFrame(&buffer, &t1));
-    CHECK(rpc::tryTakeFrame(&buffer, &t2));
-    CHECK(!rpc::tryTakeFrame(&buffer, &t3));
+    CHECK(rpc::tryTakeFrame(&buffer, &t1) == rpc::FrameState::kOk);
+    CHECK(rpc::tryTakeFrame(&buffer, &t2) == rpc::FrameState::kOk);
+    CHECK(rpc::tryTakeFrame(&buffer, &t3) == rpc::FrameState::kExpectMore);
     CHECK(t1 == f1);
     CHECK(t2 == f2);
     CHECK(buffer.readableBytes() == 0);
 }
 
 // ------------------------------------------------------------------
-// 6. 一个完整帧 + 下一个帧的一部分
+// 7. 一个完整帧 + 下一个帧的一部分
 // ------------------------------------------------------------------
 void testPartialTail() {
-    std::string f1 = rpc::encodeRequest(raftMethod("RequestVote"), makeRequestVoteArgs());
-    std::string f2 = rpc::encodeRequest(raftMethod("AppendEntries"), raftrpc::AppendEntriesArgs());
+    std::string f1 = rpc::encodeRequest(raftMethod("RequestVote"), makeRequestVoteArgs(), 1);
+    std::string f2 = rpc::encodeRequest(raftMethod("AppendEntries"), raftrpc::AppendEntriesArgs(), 2);
 
     Buffer buffer;
     buffer.append(f1);
     buffer.append(f2.data(), 5);
 
     std::string taken;
-    CHECK(rpc::tryTakeFrame(&buffer, &taken));
+    CHECK(rpc::tryTakeFrame(&buffer, &taken) == rpc::FrameState::kOk);
     CHECK(taken == f1);
-    CHECK(!rpc::tryTakeFrame(&buffer, &taken));  // f2 还没收全
+    CHECK(rpc::tryTakeFrame(&buffer, &taken) == rpc::FrameState::kExpectMore);  // f2 还没收全
     CHECK(buffer.readableBytes() == 5);
 
     buffer.append(f2.data() + 5, f2.size() - 5);
-    CHECK(rpc::tryTakeFrame(&buffer, &taken));
+    CHECK(rpc::tryTakeFrame(&buffer, &taken) == rpc::FrameState::kOk);
     CHECK(taken == f2);
     CHECK(buffer.readableBytes() == 0);
 }
 
 // ------------------------------------------------------------------
-// 7. 损坏的 frame_len：小于 4
+// 8. 损坏的 frame_len：小于 4
 // ------------------------------------------------------------------
 void testCorruptSmallFrameLen() {
     std::string bad;
@@ -225,12 +263,12 @@ void testCorruptSmallFrameLen() {
     buffer.append(bad);
 
     std::string taken;
-    CHECK(!rpc::tryTakeFrame(&buffer, &taken));
+    CHECK(rpc::tryTakeFrame(&buffer, &taken) == rpc::FrameState::kCorrupt);
     CHECK(buffer.readableBytes() == bad.size());  // 失败时不消费
 }
 
 // ------------------------------------------------------------------
-// 8. 超大 frame_len：超过 64MB 上限
+// 9. 超大 frame_len：超过 64MB 上限
 // ------------------------------------------------------------------
 void testOversizedFrameLen() {
     std::string bad;
@@ -240,50 +278,52 @@ void testOversizedFrameLen() {
     buffer.append(bad);
 
     std::string taken;
-    CHECK(!rpc::tryTakeFrame(&buffer, &taken));
+    CHECK(rpc::tryTakeFrame(&buffer, &taken) == rpc::FrameState::kCorrupt);
     CHECK(buffer.readableBytes() == 4);
 }
 
 // ------------------------------------------------------------------
-// 9. header_len 超过帧内剩余长度
+// 10. header_len 超过帧内剩余长度
 // ------------------------------------------------------------------
 void testHeaderLenExceedsFrame() {
-    std::string frame = rpc::encodeRequest(raftMethod("RequestVote"), makeRequestVoteArgs());
+    std::string frame = rpc::encodeRequest(raftMethod("RequestVote"), makeRequestVoteArgs(), kRequestId);
     std::string bad = frame;
     writeU32(&bad, 4, static_cast<uint32_t>(bad.size()));  // header_len 过大
 
     rpc::RpcRequestHeader header;
     std::string args;
-    CHECK(!rpc::decodeRequest(bad, &header, &args));
+    CHECK(rpc::decodeRequest(bad, &header, &args) == rpc::FrameState::kCorrupt);
 }
 
 // ------------------------------------------------------------------
-// 10. 帧头 frame_len 与实际帧大小不一致
+// 11. 帧头 frame_len 与实际帧大小不一致
 // ------------------------------------------------------------------
 void testFrameLenMismatch() {
-    std::string frame = rpc::encodeRequest(raftMethod("RequestVote"), makeRequestVoteArgs());
+    std::string frame = rpc::encodeRequest(raftMethod("RequestVote"), makeRequestVoteArgs(), kRequestId);
     std::string bad = frame;
     writeU32(&bad, 0, static_cast<uint32_t>(bad.size() + 4));
 
     rpc::RpcRequestHeader header;
     std::string args;
-    CHECK(!rpc::decodeRequest(bad, &header, &args));
+    CHECK(rpc::decodeRequest(bad, &header, &args) == rpc::FrameState::kCorrupt);
 
-    std::string responseFrame = rpc::encodeResponse(raftrpc::RequestVoteReply());
+    std::string responseFrame = rpc::encodeResponse(raftrpc::RequestVoteReply(), 0, "", kRequestId);
     std::string badResponse = responseFrame;
     writeU32(&badResponse, 0, static_cast<uint32_t>(badResponse.size() + 4));
 
+    rpc::RpcResponseHeader rspHeader;
     raftrpc::RequestVoteReply reply;
-    CHECK(!rpc::decodeResponse(badResponse, &reply));
+    CHECK(rpc::decodeResponse(badResponse, &rspHeader, &reply) == rpc::FrameState::kCorrupt);
 }
 
 // ------------------------------------------------------------------
-// 11. RpcRequestHeader.args_size 与实际 args 长度不一致
+// 12. RpcRequestHeader.args_size 与实际 args 长度不一致
 // ------------------------------------------------------------------
 void testArgsSizeMismatch() {
     rpc::RpcRequestHeader header;
     header.set_service_name("RaftService");
     header.set_method_name("RequestVote");
+    header.set_request_id(7);
     header.set_args_size(999);  // 故意不一致
 
     std::string headerStr;
@@ -298,11 +338,41 @@ void testArgsSizeMismatch() {
 
     rpc::RpcRequestHeader outHeader;
     std::string outArgs;
-    CHECK(!rpc::decodeRequest(frame, &outHeader, &outArgs));
+    CHECK(rpc::decodeRequest(frame, &outHeader, &outArgs) == rpc::FrameState::kCorrupt);
 }
 
 // ------------------------------------------------------------------
-// 12. 1MB 大消息
+// 13. request_id == 0 视为损坏
+// ------------------------------------------------------------------
+void testZeroRequestId() {
+    std::string frame = rpc::encodeRequest(raftMethod("RequestVote"), makeRequestVoteArgs(), 0);
+
+    Buffer buffer;
+    buffer.append(frame);
+
+    std::string taken;
+    CHECK(rpc::tryTakeFrame(&buffer, &taken) == rpc::FrameState::kOk);
+
+    rpc::RpcRequestHeader header;
+    std::string args;
+    CHECK(rpc::decodeRequest(taken, &header, &args) == rpc::FrameState::kCorrupt);
+}
+
+// ------------------------------------------------------------------
+// 14. header_len == 0 视为损坏
+// ------------------------------------------------------------------
+void testZeroHeaderLen() {
+    std::string frame;
+    appendU32(&frame, 8);  // frame_len
+    appendU32(&frame, 0);  // header_len
+
+    rpc::RpcRequestHeader header;
+    std::string args;
+    CHECK(rpc::decodeRequest(frame, &header, &args) == rpc::FrameState::kCorrupt);
+}
+
+// ------------------------------------------------------------------
+// 15. 1MB 大消息
 // ------------------------------------------------------------------
 void testLargeRequest() {
     raftrpc::AppendEntriesArgs request;
@@ -315,7 +385,7 @@ void testLargeRequest() {
     entry->set_index(1);
     entry->set_command(big);
 
-    std::string frame = rpc::encodeRequest(raftMethod("AppendEntries"), request);
+    std::string frame = rpc::encodeRequest(raftMethod("AppendEntries"), request, kRequestId);
     CHECK(!frame.empty());
     CHECK(frame.size() > big.size());
 
@@ -323,11 +393,12 @@ void testLargeRequest() {
     buffer.append(frame);
 
     std::string taken;
-    CHECK(rpc::tryTakeFrame(&buffer, &taken));
+    CHECK(rpc::tryTakeFrame(&buffer, &taken) == rpc::FrameState::kOk);
 
     rpc::RpcRequestHeader header;
     std::string args;
-    CHECK(rpc::decodeRequest(taken, &header, &args));
+    CHECK(rpc::decodeRequest(taken, &header, &args) == rpc::FrameState::kOk);
+    CHECK(header.request_id() == kRequestId);
     CHECK(header.service_name() == "RaftService");
     CHECK(header.method_name() == "AppendEntries");
 
@@ -338,12 +409,25 @@ void testLargeRequest() {
 }
 
 // ------------------------------------------------------------------
-// 13. 响应帧太短
+// 16. 响应帧太短
 // ------------------------------------------------------------------
 void testDecodeResponseTooShort() {
     std::string bad = "abc";
+    rpc::RpcResponseHeader header;
     raftrpc::RequestVoteReply reply;
-    CHECK(!rpc::decodeResponse(bad, &reply));
+    CHECK(rpc::decodeResponse(bad, &header, &reply) == rpc::FrameState::kCorrupt);
+}
+
+// ------------------------------------------------------------------
+// 17. 长度字段本身不完整
+// ------------------------------------------------------------------
+void testIncompleteLengthPrefix() {
+    Buffer buffer;
+    buffer.append("ab", 2);
+
+    std::string taken;
+    CHECK(rpc::tryTakeFrame(&buffer, &taken) == rpc::FrameState::kExpectMore);
+    CHECK(buffer.readableBytes() == 2);
 }
 
 }  // namespace
@@ -352,6 +436,7 @@ int main() {
     testRequestRoundTrip();
     testResponseRoundTrip();
     testEmptyResponse();
+    testErrorResponse();
     testHalfPacket();
     testStickyPacket();
     testPartialTail();
@@ -360,8 +445,11 @@ int main() {
     testHeaderLenExceedsFrame();
     testFrameLenMismatch();
     testArgsSizeMismatch();
+    testZeroRequestId();
+    testZeroHeaderLen();
     testLargeRequest();
     testDecodeResponseTooShort();
+    testIncompleteLengthPrefix();
 
     if (g_failures == 0) {
         std::cout << "ALL TESTS PASSED (" << g_checks << " checks)" << std::endl;
