@@ -13,6 +13,9 @@ add_subdirectory(NetLib)
 # RPC 框架与协议
 add_subdirectory(RPC)
 
+# 跳表与状态机存储
+add_subdirectory(Storage)
+
 # 本地参考实现（reference/ 被 .gitignore 忽略；不存在时自动跳过）
 # if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/reference/rpc_framework/CMakeLists.txt)
 #     add_subdirectory(reference/rpc_framework)
