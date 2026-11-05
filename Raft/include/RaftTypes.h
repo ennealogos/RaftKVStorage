@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -64,6 +65,9 @@ struct AppendEntriesArgs {
     // 本次需要复制的日志条目
     // 为空表示心跳；可以包含多条日志
     std::vector<LogEntry> entries;
+
+    // 用于匹配异步 AppendEntries 回复，避免旧回复污染新的在途请求。
+    std::uint64_t requestId = 0;
 };
 
 // 跟随者对领导者 日志复制/心跳请求的回复
@@ -88,6 +92,9 @@ struct AppendEntriesReply {
     */ 
     int conflictTerm = -1; // -1 表示响应者没有 prevLogIndex 位置的日志。这是对应的任期号
     int conflictIndex = 0; // 
+
+    // 原样回显请求中的 requestId。
+    std::uint64_t requestId = 0;
 };
 
 
